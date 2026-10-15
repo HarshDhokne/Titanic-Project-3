@@ -1,12 +1,24 @@
 from pathlib import Path
 
-import joblib
 import pandas as pd
 import streamlit as st
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
 
 
 APP_DIR = Path(__file__).resolve().parent
-MODEL_PATH = APP_DIR / "lregression.pkl"
 DATA_PATH = APP_DIR / "Titanic-Dataset.csv"
 FEATURE_COLUMNS = [
     "Pclass",
@@ -150,25 +162,80 @@ st.markdown(
 )
 
 
-@st.cache_resource
-def load_model():
-    return joblib.load(MODEL_PATH)
-
-
 @st.cache_data
 def load_passengers():
     return pd.read_csv(DATA_PATH)
 
 
-if not MODEL_PATH.is_file():
-    st.error(f"Model file not found: {MODEL_PATH.name}. Run the training notebook first.")
-    st.stop()
 if not DATA_PATH.is_file():
     st.error(f"Passenger dataset not found: {DATA_PATH.name}.")
     st.stop()
 
-model = load_model()
 passengers = load_passengers()
+prepared_passengers = passengers.copy()
+prepared_passengers["Age"] = prepared_passengers["Age"].fillna(
+    prepared_passengers["Age"].mean()
+)
+prepared_passengers["Embarked"] = prepared_passengers["Embarked"].fillna(
+    prepared_passengers["Embarked"].mode().iloc[0]
+)
+prepared_passengers["family_size"] = (
+    prepared_passengers["SibSp"] + prepared_passengers["Parch"] + 1
+)
+prepared_passengers["Isalone"] = (
+    prepared_passengers["family_size"] == 1
+).astype(int)
+prepared_passengers = pd.get_dummies(
+    prepared_passengers,
+    columns=["Sex", "Embarked"],
+    drop_first=True,
+    dtype=int,
+)
+features = prepared_passengers.reindex(columns=FEATURE_COLUMNS)
+labels = prepared_passengers["Survived"].astype(int)
+
+
+@st.cache_resource
+def train_models(features, labels):
+    X_train, X_test, y_train, y_test = train_test_split(
+        features,
+        labels,
+        test_size=0.2,
+        random_state=42,
+        stratify=labels,
+    )
+    models = {
+        "Logistic Regression": make_pipeline(
+            StandardScaler(), LogisticRegression(max_iter=1000, random_state=42)
+        ),
+        "Linear SVM": make_pipeline(
+            StandardScaler(), SVC(kernel="linear", probability=True, random_state=42)
+        ),
+        "K-Nearest Neighbors": make_pipeline(
+            StandardScaler(), KNeighborsClassifier(n_neighbors=3)
+        ),
+    }
+    metrics = []
+    predictions = {}
+    for name, estimator in models.items():
+        estimator.fit(X_train, y_train)
+        predicted = estimator.predict(X_test)
+        probabilities = estimator.predict_proba(X_test)[:, 1]
+        predictions[name] = predicted
+        metrics.append(
+            {
+                "Algorithm": name,
+                "Accuracy": accuracy_score(y_test, predicted),
+                "Precision": precision_score(y_test, predicted, zero_division=0),
+                "Recall": recall_score(y_test, predicted, zero_division=0),
+                "F1 score": f1_score(y_test, predicted, zero_division=0),
+                "ROC AUC": roc_auc_score(y_test, probabilities),
+            }
+        )
+    return models, pd.DataFrame(metrics).set_index("Algorithm"), y_test, predictions
+
+
+models, model_metrics, y_test, test_predictions = train_models(features, labels)
 
 with st.sidebar:
     st.markdown("## ⚓  SURVIVAL STUDIO")
@@ -176,11 +243,11 @@ with st.sidebar:
     st.markdown("### A voyage through the data")
     st.markdown(
         "Explore the people aboard the Titanic and estimate a passenger's "
-        "chance of survival with a logistic-regression model."
+        "chance of survival using three machine-learning algorithms."
     )
     st.markdown("---")
-    st.caption("MODEL")
-    st.markdown("Logistic regression")
+    st.caption("MODELS")
+    st.markdown("Logistic Regression · Linear SVM · KNN")
     st.caption("DATA")
     st.markdown(f"{len(passengers):,} passenger records")
     st.markdown("---")
@@ -193,7 +260,7 @@ st.markdown(
 st.markdown('<h1 class="hero-title">The voyage, in numbers.</h1>', unsafe_allow_html=True)
 st.markdown(
     '<p class="hero-copy">Step aboard the Titanic dataset. Explore the passenger '
-    'manifest, then try a survival estimate using class, family, and embarkation details.</p>',
+    'manifest, compare three survival models, then try a passenger estimate.</p>',
     unsafe_allow_html=True,
 )
 
@@ -217,16 +284,19 @@ for column, (label, value) in zip(metric_columns, metrics):
             unsafe_allow_html=True,
         )
 
-prediction_tab, insights_tab = st.tabs(["Passenger estimate", "Manifest insights"])
+prediction_tab, insights_tab, comparison_tab = st.tabs(
+    ["Passenger estimate", "Manifest insights", "Model comparison"]
+)
 
 with prediction_tab:
     st.markdown('<div class="section-title">Build a passenger profile</div>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="section-copy">Adjust the details below to see what the model predicts.</p>',
+        '<p class="section-copy">Choose an algorithm and adjust the details below to see its prediction.</p>',
         unsafe_allow_html=True,
     )
 
     with st.form("passenger_form"):
+        selected_model = st.selectbox("Algorithm", list(models))
         left, right = st.columns(2, gap="large")
         with left:
             passenger_class = st.selectbox(
@@ -277,7 +347,7 @@ with prediction_tab:
 
     if submitted:
         family_size = int(siblings_spouses + parents_children + 1)
-        features = pd.DataFrame(
+        passenger_features = pd.DataFrame(
             [[
                 passenger_class,
                 age,
@@ -292,16 +362,19 @@ with prediction_tab:
             ]],
             columns=FEATURE_COLUMNS,
         )
-        survived = int(model.predict(features)[0])
-        probabilities = model.predict_proba(features)[0]
-        survival_probability = float(probabilities[list(model.classes_).index(1)])
+        estimator = models[selected_model]
+        survived = int(estimator.predict(passenger_features)[0])
+        probabilities = estimator.predict_proba(passenger_features)[0]
+        survival_probability = float(
+            probabilities[list(estimator.classes_).index(1)]
+        )
 
         if survived:
-            result_title = "The model predicts survival."
+            result_title = f"{selected_model} predicts survival."
             result_copy = "This profile is more likely to survive according to the fitted model."
             st.success(f"Estimated survival likelihood: {survival_probability:.1%}")
         else:
-            result_title = "The model predicts non-survival."
+            result_title = f"{selected_model} predicts non-survival."
             result_copy = "This profile is less likely to survive according to the fitted model."
             st.warning(f"Estimated survival likelihood: {survival_probability:.1%}")
 
@@ -347,6 +420,44 @@ with insights_tab:
     insight_columns[1].metric("Men survived", f"{male_survival:.1f}%")
     insight_columns[2].metric("Average age", f"{passengers['Age'].mean():.1f} years")
     st.caption(
-        "Charts describe this dataset only. The prediction model was trained on "
-        "passenger class, age, fare, family size, sex, and embarkation port."
+        "Charts describe this dataset only. The models were trained on "
+        "passenger class, age, fare, family size, sex, and embarkation port. "
+        "All three algorithms are compared on the same stratified 20% holdout set."
     )
+
+with comparison_tab:
+    st.markdown(
+        '<div class="section-title">Compare the three algorithms</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<p class="section-copy">Each model uses the same stratified 80/20 train-test '
+        'split (random state 42) and standardized features.</p>',
+        unsafe_allow_html=True,
+    )
+    model_columns = st.columns(len(models))
+    for column, (name, scores) in zip(model_columns, model_metrics.iterrows()):
+        with column:
+            st.markdown(f"#### {name}")
+            for metric, score in scores.items():
+                st.progress(float(score), text=f"{metric}: {score:.1%}")
+
+    st.dataframe(
+        model_metrics.style.format("{:.1%}"),
+        width="stretch",
+    )
+
+    st.markdown("#### Confusion matrices")
+    confusion_columns = st.columns(len(models))
+    for column, (name, predicted) in zip(confusion_columns, test_predictions.items()):
+        with column:
+            st.markdown(f"**{name}**")
+            matrix = confusion_matrix(y_test, predicted, labels=[0, 1])
+            st.dataframe(
+                pd.DataFrame(
+                    matrix,
+                    index=["Actual: did not survive", "Actual: survived"],
+                    columns=["Predicted: did not survive", "Predicted: survived"],
+                ),
+                width="stretch",
+            )
